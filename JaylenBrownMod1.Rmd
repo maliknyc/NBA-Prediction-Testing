@@ -1,0 +1,448 @@
+---
+title: "JaylenBrownMod1.Rmd"
+author: "Felix Liang"
+date: "2024-07-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list = ls())
+
+require(tidymodels) # useful for k-means and auc
+require(tidytext) # this is for NLP
+require(tidyverse)
+require(plotly)
+require(scales) # this gives us percent(): converts fraction into percent
+require(ranger)
+require(zoo)
+require(ggcorrplot) # for correlation matrices
+require(car)
+require(optimx) # optimizations 
+
+jb <- read_csv("https://raw.githubusercontent.com/maliknyc/NBA-Prediction-Testing/main/JaylenBrownTest.csv")
+
+#view(jb)
+glimpse(jb)
+```
+
+# To predict chances of over 21.5 points
+```{r}
+goal <- 21.5
+
+names(jb)
+
+jb_cleaned <- jb %>%
+  rename(TPA = `3PA`, TPP = `3P%`) %>%
+  mutate(Date = as.Date(Date, format = "%m/%d/%Y")) %>%
+  arrange(Date) %>%
+  select(Date, Opp, MP, FGA, TPA, TPP, TRB, AST, STL, PTS, PRA, PR, PA, RA, SB)
+
+# Calculate average points vs team only using games prior to the game being predicted
+avg_points_vs_team <- jb_cleaned %>%
+  group_by(Opp) %>%
+  mutate(avgPTS_vteam = lag(cummean(PTS))) %>%
+  ungroup()
+
+jb_cleaned <- jb_cleaned %>%
+  left_join(avg_points_vs_team %>% select(Date, Opp, avgPTS_vteam), by = c("Date", "Opp"))
+
+#summary(jb_cleaned)
+#view(jb_cleaned)
+
+```
+
+# Defensive Ratings Variable
+```{r}
+def_ratings <- data.frame(
+  Opp = c("BOS", "DEN", "OKC", "MIN", "LAC", "DAL", "NYK", "MIL", "NOP", "PHO", "CLE", "IND", "LAL", "ORL", "PHI", "GSW", "MIA", "SAC", "HOU", "CHI", "ATL", "BRK", "UTA", "MEM", "TOR", "SAS", "CHO", "POR", "WAS", "DET"),
+  DEF_RTG = c(110.6, 112.3, 111.0, 110.4, 113.1, 114.9, 111.4, 110.2, 111.9, 113.7, 115.0, 117.6, 114.8, 110.8, 113.0, 114.5, 111.5, 114.4, 112.8, 115.7, 115.4, 114.6, 119.6, 113.7, 115.6, 116.1, 116.9, 118.0, 118.6, 118.0)
+)
+jb_cleaned <- jb_cleaned %>%
+  left_join(def_ratings, by = "Opp")
+
+#view(jb_cleaned)
+
+jb_cleaned <- jb_cleaned %>%
+  drop_na()
+```
+
+# Days Rest Variable
+```{r}
+jb_cleaned <- jb_cleaned %>%
+  mutate(days_rest = as.numeric(difftime(Date, lag(Date), units = 'days')))
+
+jb_cleaned <- jb_cleaned %>%
+  mutate(days_rest = ifelse(days_rest > 30, 30, days_rest)) %>%
+  drop_na()
+
+```
+
+
+```{r}
+# Calculate moving averages
+jb_ra <- jb_cleaned %>%
+  mutate(Opp = as.factor(Opp), over_21_5 = ifelse(PTS > goal, 1, 0),
+    avg_PTS_5 = lag(rollapply(PTS, width = 5, FUN = mean, fill = NA, align = "right")),
+    avg_PTS_10 = lag(rollapply(PTS, width = 10, FUN = mean, fill = NA, align = "right")),
+    avg_TPA_5 = lag(rollapply(TPA, width = 5, FUN = mean, fill = NA, align = "right")),
+    avg_PTS_3 = lag(rollapply(PTS, width = 3, FUN = mean, fill = NA, align = "right")),
+    avg_PTS_4_to_6 = lag(rollapply(PTS, width = 6, FUN = function(x) mean(x[1:3]), fill = NA, align = "right")),
+    avg_PTS_7_to_9 = lag(rollapply(PTS, width = 9, FUN = function(x) mean(x[1:3]), fill = NA, align = "right")),
+    avg_PTS_10_to_12 = lag(rollapply(PTS, width = 12, FUN = function(x) mean(x[1:3]), fill = NA, align = "right")),
+    avg_PTS_season = lag(cummean(PTS)),
+    diff_avg_PTS_3_10 = lag(rollapply(PTS, width = 10, FUN = mean, fill = NA, align = "right") - avg_PTS_3),
+    trend_PTS = lag(rollapply(PTS, width = 5, FUN = function(x) coef(lm(x ~ seq_along(x)))[2], fill = NA, align = "right")),
+    std_dev_PTS_5 = lag(rollapply(PTS, width = 5, FUN = sd, fill = NA, align = "right")),
+    std_dev_PTS_10 = lag(rollapply(PTS, width = 10, FUN = sd, fill = NA, align = "right")),
+    perc_over = lag(rollapply(over_21_5, width = 10, FUN = mean, fill = NA, align = "right") * 100)
+  )
+
+#view(jb_ra)
+
+jb_ra_cleaned <- jb_ra %>%
+  drop_na()
+
+#view(jb_ra_cleaned)
+
+```
+
+```{r}
+jb_vars <- jb_ra_cleaned %>%
+  mutate(int_PTS5_TPA5 = avg_PTS_5 * avg_TPA_5) %>%
+  select(Date, Opp, avgPTS_vteam, days_rest, avg_PTS_5, avg_PTS_10, avg_TPA_5, DEF_RTG, over_21_5, avg_PTS_3, avg_PTS_4_to_6, avg_PTS_7_to_9, avg_PTS_10_to_12, avg_PTS_season, trend_PTS, std_dev_PTS_10, int_PTS5_TPA5, perc_over)
+
+#view(jb_vars)
+```
+
+# Correlation Matrices
+```{r}
+jb_vars_corrm_dat <- jb_vars %>% select(days_rest, avg_PTS_5, avg_TPA_5, avg_PTS_3, avg_PTS_4_to_6, avg_PTS_7_to_9, avg_PTS_10_to_12, avg_PTS_season, trend_PTS, std_dev_PTS_10, int_PTS5_TPA5, perc_over)
+jb_vars_corrm <- cor(jb_vars_corrm_dat)
+ggcorrplot(jb_vars_corrm, method = 'circle', type = 'lower', lab = T, lab_size = 3, colors = c('red', 'white', 'blue'), title = "New Model Corr Matrix", ggtheme = theme_minimal())
+
+```
+
+# Matrices check 2
+```{r}
+jb_vars_corrm_dat <- jb_vars %>% select(days_rest, avg_PTS_5, avg_TPA_5, avg_PTS_7_to_9, avg_PTS_10_to_12, trend_PTS, std_dev_PTS_10, int_PTS5_TPA5, perc_over)
+jb_vars_corrm <- cor(jb_vars_corrm_dat)
+ggcorrplot(jb_vars_corrm, method = 'circle', type = 'lower', lab = T, lab_size = 3, colors = c('red', 'white', 'blue'), title = "New Model Corr Matrix", ggtheme = theme_minimal())
+
+```
+
+# VIF and Variable Adjustments
+```{r}
+
+lm_vars <- lm(over_21_5 ~ days_rest + DEF_RTG + avgPTS_vteam + avg_PTS_5 + avg_TPA_5 + avg_PTS_3 + avg_PTS_4_to_6 + avg_PTS_7_to_9 + avg_PTS_10_to_12 + avg_PTS_season + trend_PTS + std_dev_PTS_10 + int_PTS5_TPA5 + perc_over, data = jb_vars)
+
+lm_vars_vif <- vif(lm_vars)
+
+# VIF CHECK 2
+lm_vars <- lm(over_21_5 ~ days_rest + DEF_RTG + avgPTS_vteam + avg_PTS_5 + avg_TPA_5 + avg_PTS_7_to_9 + avg_PTS_10_to_12 + std_dev_PTS_10 + int_PTS5_TPA5 + perc_over, data = jb_vars)
+
+lm_vars_vif <- vif(lm_vars)
+
+```
+
+# avg_PTS_5 vs avg_PTS_4_to_6 vs avg_PTS_10
+```{r}
+model_avg_PTS_5 <- glm(over_21_5 ~ avg_PTS_5, data = jb_vars, family = binomial)
+summary(model_avg_PTS_5)
+
+model_avg_PTS_10 <- glm(over_21_5 ~ avg_PTS_10, data = jb_vars, family = binomial)
+summary(model_avg_PTS_10)
+
+model_avg_PTS_4_to_6 <- glm(over_21_5 ~ avg_PTS_4_to_6, data = jb_vars, family = binomial)
+summary(model_avg_PTS_4_to_6)
+
+#model_avg_PTS_10
+
+# avg_PTS_5 wins!
+```
+
+# Try splits of composite
+```{r}
+jb_vars <- jb_vars %>%
+  mutate(comp_opp_50_50 = 0.5 * DEF_RTG + 0.5 * avgPTS_vteam,
+         comp_opp_75_25 = 0.75 * DEF_RTG + 0.25 * avgPTS_vteam,
+         comp_opp_25_75 = 0.25 * DEF_RTG + 0.75 * avgPTS_vteam)
+
+form.vars5050 <- "over_21_5 ~ days_rest + comp_opp_50_50 + avg_TPA_5 + avg_PTS_5 + avg_PTS_7_to_9 + avg_PTS_10_to_12 + avg_PTS_season + trend_PTS + std_dev_PTS_10 + int_PTS5_TPA5 + perc_over"
+form.vars7525 <- "over_21_5 ~ days_rest + comp_opp_75_25 + avg_TPA_5 + avg_PTS_5 + avg_PTS_7_to_9 + avg_PTS_10_to_12 + avg_PTS_season + trend_PTS + std_dev_PTS_10 + int_PTS5_TPA5 + perc_over"
+form.vars2575 <- "over_21_5 ~ days_rest + comp_opp_25_75 + avg_TPA_5 + avg_PTS_5 + avg_PTS_7_to_9 + avg_PTS_10_to_12 + avg_PTS_season + trend_PTS + std_dev_PTS_10 + int_PTS5_TPA5 + perc_over"
+
+glm_vars5050 <- glm(as.formula(form.vars5050), jb_vars, family = binomial)
+glm_vars7525 <- glm(as.formula(form.vars7525), jb_vars, family = binomial)
+glm_vars2575 <- glm(as.formula(form.vars2575), jb_vars, family = binomial)
+
+summary(glm_vars5050) # second best
+summary(glm_vars7525) # worst
+
+summary(glm_vars2575) # BEST
+
+# Prelim AUC checks
+toEval_2575 <- jb_vars %>%
+  mutate(prob_over21_5 = predict(glm_vars2575, type = 'response'),
+  over_21_5 = factor(over_21_5, levels = c('1', '0')))
+glm_vars2575_auc <- yardstick::roc_auc(toEval_2575, over_21_5, prob_over21_5) # 0.75
+
+form.vars_cleaned1 <- "over_21_5 ~ comp_opp_25_75 + avg_PTS_5 + avg_TPA_5 + avg_PTS_7_to_9 + avg_PTS_10_to_12 + std_dev_PTS_10 + int_PTS5_TPA5 + perc_over"
+
+glm_cleaned <- glm(as.formula(form.vars_cleaned1), jb_vars, family = binomial)
+
+summary(glm_cleaned)
+
+toEval_cleaned1 <- jb_vars %>%
+  mutate(prob_over21_5 = predict(glm_cleaned, type = 'response'),
+  over_21_5 = factor(over_21_5, levels = c('1', '0')))
+
+glm_cleaned_auc <- yardstick::roc_auc(toEval_cleaned1, over_21_5, prob_over21_5) # 0.75
+
+# Cleaned is pretty good
+
+jb_vars <- jb_vars %>%
+  mutate(predicted_prob = predict(glm_cleaned, type = 'response'))
+
+```
+
+# Visualizations
+```{r}
+# Plot predicted probabilities vs. comp_opp_25_75
+plot_comp_opp_25_75 <- ggplot(jb_vars, aes(x = comp_opp_25_75, y = predicted_prob)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "glm", method.args = list(family = "binomial"), se = FALSE, color = "blue") +
+  labs(title = "Predicted Probability vs. comp_opp_25_75", x = "comp_opp_25_75", y = "Predicted Probability")
+
+# Plot predicted probabilities vs. avg_PTS_5
+plot_avg_PTS_5 <- ggplot(jb_vars, aes(x = avg_PTS_5, y = predicted_prob)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "glm", method.args = list(family = "binomial"), se = FALSE, color = "blue") +
+  labs(title = "Predicted Probability vs. avg_PTS_5", x = "avg_PTS_5", y = "Predicted Probability")
+
+# Plot predicted probabilities vs. trend_PTS
+plot_trend_PTS <- ggplot(jb_vars, aes(x = trend_PTS, y = predicted_prob)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "glm", method.args = list(family = "binomial"), se = FALSE, color = "blue") +
+  labs(title = "Predicted Probability vs. trend_PTS", x = "trend_PTS", y = "Predicted Probability")
+
+# Display the plots
+plot_comp_opp_25_75
+plot_avg_PTS_5
+plot_trend_PTS
+```
+
+
+# Cross-validation
+```{r}
+cvRes <- NULL
+for(i in 1:1000) {
+  inds <- sample(1:nrow(jb_vars), size = round(nrow(jb_vars)*.8), replace = F)
+  train <- jb_vars %>% slice(inds)
+  test <- jb_vars %>% slice(-inds)
+  
+  # Train the model (copy regression, but use train set as data)
+  model_clean <- glm(as.formula(form.vars_cleaned1), train, family = binomial(link = 'logit'))
+  
+  # Predicting model on test data. Overwrite test object. Add newdata=test
+  toEval_CV <- test %>%
+  mutate(prob_over21_5 = predict(model_clean, newdata = test, type = 'response'),
+         over_21_5 = factor(over_21_5, levels = c('1', '0')))
+
+  cvRes <- cvRes %>%
+    bind_rows(yardstick::roc_auc(toEval_CV, over_21_5, prob_over21_5) %>%
+                mutate(cvInd = i))
+  
+}
+
+cvRes %>%
+  summarise(mean_auc = mean(.estimate))
+
+# AUC: 0.601
+```
+
+```{r}
+jb_vars <- jb_vars %>%
+  mutate(predicted_prob = predict(glm_cleaned, newdata = jb_vars, type = 'response'))
+jb_vars %>%
+  select(Date, Opp, over_21_5, predicted_prob) %>%
+  print(n = 90)
+
+write.csv(jb_vars %>% select(Date, Opp, over_21_5, predicted_prob), "predictions_jb.csv", row.names = FALSE)
+
+current_dir <- getwd()
+print(current_dir)
+
+```
+
+
+
+
+
+
+
+
+
+# [TEST] Optimization of composite (a x avgPTS_vteam) + (b x DEF_RTG) variable with glm
+```{r}
+create_comp <- function(df, wt1, wt2) {
+  jb_vars %>%
+    mutate(comp_score = wt1 * DEF_RTG + wt2 * avgPTS_vteam)
+}
+
+calc_log_loss <- function(wts, df) {
+  weight_def_rtg <- weights[1]
+  weight_avg_pts <- weights[2]
+
+  comp <- create_comp(jb_vars, weight_def_rtg, weight_avg_pts)
+
+  glm_vars <- glm(over_21_5 ~ days_rest + composite_score + avg_PTS_3 + avg_PTS_4_to_6 + 
+                avg_PTS_7_to_9 + avg_PTS_10_to_12 + avg_PTS_season + trend_PTS + 
+                std_dev_PTS_10, data = df, family = binomial(link = 'logit'))
+
+  preds <- predict(model, type = 'response')
+  actuals <- df$over_21_5
+  
+  -mean(actuals * log(preds) + (1 - actuals) * log(1 - preds))
+}
+
+init_weights <- c(0.5, 0.5)
+
+optimal_weights <- optimx(par = init_weights, fn = calc_log_loss, df = jb_vars, method = "L-BFGS-B", lower = c(0,0), upper = c(1,1))
+
+opt_wt_def_rtg <- optimal_weights$par[1]
+opt_wt_avg_pts <- optimal_weights$par[2]
+
+```
+
+
+
+# Linear Models
+```{r}
+summary(lm_5)
+
+summary(lm_10)
+
+glm_5 <- glm(over_21_5 ~ avg_FGA_5 + avg_TPA_5 + avg_TPP_5 + avg_TRB_5 + avg_AST_5 + avg_STL_5 + avg_PTS_5 + Opp, data = jb_5, family = binomial(link = 'logit'))
+
+summary(glm_5)
+
+glm_10 <- glm(over_21_5 ~ avg_FGA_10 + avg_TPA_10 + avg_TPP_10 + avg_TRB_10 + avg_AST_10 + avg_STL_10 + avg_PTS_10 + Opp, data = jb_10, family = binomial(link = 'logit'))
+
+summary(glm_10)
+
+# Only OppIND within Opp is significant. Replace Opp with Opp_IND.
+
+jb_5 <- jb_5 %>% 
+  mutate(Opp_IND = ifelse(Opp == "IND", 1, 0)) %>%
+    select(Date, Opp_IND, over_21_5, avg_FGA_5, avg_TPA_5, avg_TPP_5, avg_TRB_5, avg_AST_5, avg_STL_5, avg_PTS_5)
+
+jb_10 <- jb_10 %>%
+  mutate(Opp_IND = ifelse(Opp == "IND", 1, 0)) %>%
+  select(Date, Opp_IND, over_21_5, avg_FGA_10, avg_TPA_10, avg_TPP_10, avg_TRB_10, avg_AST_10, avg_STL_10, avg_PTS_10)
+
+# Redo linear models
+
+lm_5 <- lm(over_21_5 ~ avg_FGA_5 + avg_TPA_5 + avg_TPP_5 + avg_TRB_5 + avg_AST_5 + avg_STL_5 + avg_PTS_5 + Opp_IND, data = jb_5)
+
+lm_10 <- lm(over_21_5 ~ avg_FGA_10 + avg_TPA_10 + avg_TPP_10 + avg_TRB_10 + avg_AST_10 + avg_STL_10 + avg_PTS_10 + Opp_IND, data = jb_10)
+
+summary(lm_5)
+summary(lm_10)
+
+# Drop insignificant variables pt. 1
+
+lm_5 <- lm(over_21_5 ~ avg_TPA_5 + avg_PTS_5 + Opp_IND, data = jb_5)
+
+summary(lm_5)
+
+# Drop insignificant variables pt. 2
+
+lm_5 <- lm(over_21_5 ~ avg_PTS_5 + Opp_IND, data = jb_5)
+
+summary(lm_5)
+
+lm_5_EVAL <- jb_5 %>%
+  mutate(prob_over21_5 = predict(lm_5),
+         over_21_5 = factor(over_21_5, levels = c('1', '0')))
+lm_5_auc <- yardstick::roc_auc(lm_5_EVAL, over_21_5, prob_over21_5)
+
+lm_test <- lm(over_21_5 ~ avg_FGA_5 + avg_TPA_5 + avg_TPP_5 + avg_TRB_5 + avg_AST_5 + avg_STL_5 + avg_PTS_5 + Opp_IND, data = jb_5)
+
+lm_test_EVAL <- jb_5 %>%
+  mutate(prob_over21_5 = predict(lm_test),
+         over_21_5 = factor(over_21_5, levels = c('1', '0')))
+lm_test_auc <- yardstick::roc_auc(lm_test_EVAL, over_21_5, prob_over21_5)
+
+
+```
+
+# Linear Models for Vars
+```{r}
+summary(lm_vars)
+
+glm_vars <- glm(as.formula(form.vars), jb_vars, family = binomial(link = 'logit'))
+summary(glm_vars)
+
+```
+[STOPPED ABOVE]
+
+# Check for variable skew
+```{r}
+plot_avg_PTS_5 <- jb_5 %>%
+  ggplot(aes(x = avg_PTS_5)) +
+  geom_density(color = 'red')
+
+plot_avg_PTS_5
+
+plot_avg_PTS_5_log <- jb_5 %>%
+  ggplot(aes(x = log(avg_PTS_5))) + 
+  geom_density(color = 'red')
+
+plot_avg_PTS_5_log
+
+plot_avg_TPA_5 <- jb_5 %>%
+  ggplot(aes(x = avg_TPA_5)) +
+  geom_density(color = 'red')
+
+plot_avg_TPA_5
+
+# No significant skew anywhere
+```
+
+
+# Logit Models
+```{r}
+summary(glm_5)
+summary(glm_10)
+
+# Drop insignificant variables
+glm_5 <- glm(over_21_5 ~ avg_PTS_5 + avg_TPA_5 + Opp_IND, data = jb_5, family = binomial(link = 'logit'))
+
+summary(glm_5)
+
+glm_5 <- glm(over_21_5 ~ avg_PTS_5 + Opp_IND, data = jb_5, family = binomial(link = 'logit'))
+
+glm_5_TPA <- glm(over_21_5 ~ avg_PTS_5 + Opp_IND +  avg_TPA_5, data = jb_5, family = binomial(link = 'logit'))
+
+# Quick AUC check
+
+glm_5_EVAL <- jb_5 %>%
+  mutate(prob_over21_5 = predict(glm_5, type = 'response'),
+         over_21_5 = factor(over_21_5, levels = c('1', '0')))
+glm_5_auc <- yardstick::roc_auc(glm_5_EVAL, over_21_5, prob_over21_5)
+# AUC: 0.785
+
+glm_5_TPA_EVAL <- jb_5 %>%
+  mutate(prob_over21_5 = predict(glm_5_TPA, type = 'response'),
+         over_21_5 = factor(over_21_5, levels = c('1', '0')))
+glm_5_TPA_auc <- yardstick::roc_auc(glm_5_TPA_EVAL, over_21_5, prob_over21_5)
+# AUC: 0.796
+
+```
+
+# Random Forest Models
+
