@@ -1,0 +1,180 @@
+---
+title: "NicClaxtonMod1.Rmd"
+author: "Felix Liang"
+date: "2024-07-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Clear environment
+rm(list = ls())
+
+# Load necessary libraries
+library(tidymodels)
+library(tidytext)
+library(tidyverse)
+library(plotly)
+library(scales)
+library(ranger)
+library(zoo)
+library(ggcorrplot)
+library(car)
+library(optimx)
+library(purrr)
+
+NC_23 <- read_csv("https://raw.githubusercontent.com/maliknyc/NBA-Prediction-Testing/main/2022-2023reg_Nic_Claxton.csv")
+NC_24 <- read_csv("https://raw.githubusercontent.com/maliknyc/NBA-Prediction-Testing/main/2023-2024reg_Nic_Claxton.csv")
+
+combined <- rbind(NC_23, NC_24)
+
+# view(combined)
+glimpse(combined)
+
+target <- 11.5
+
+```
+
+# Thoughts
+- trendline for field goal pct?
+- don't care about three pointers He doesn't shoot them
+
+# Pre-processing
+```{r}
+
+# Add combos
+nc <- combined %>%
+  rename(TPA = `3PA`, TPP = `3P%`, FGP = `FG%`, FTP = `FT%`, THRP = `3P`, home = ...6) %>%
+  mutate(Date = as.Date(Date, format = "%m/%d/%Y"), Opp = as.factor(Opp), over_target = ifelse(PTS > target, 1, 0)) %>%
+  arrange(Date) %>%
+  select(Date, over_target, Opp, MP, home, FG, FGA, FGP, THRP, TPA, TPP, FT, FTA, FTP, TRB, AST, STL, BLK, PTS) %>%
+  mutate(PRA = PTS + TRB + AST, 
+         PR = PTS + TRB, 
+         PA = PTS + AST, 
+         RA = TRB + AST, 
+         SB = STL + BLK,
+         home = ifelse(is.na(home), 0, 1))
+  
+# drop three point info. dude doesn't shoot threes
+
+nc <- nc %>%
+  select(-THRP, -TPA, -TPP) %>%
+  drop_na()
+
+# Convert MP into minutes played
+nc <- nc %>%
+  separate(MP, into = c("minutes", "seconds", "centiseconds"), sep = ":") %>%
+  mutate(
+    minutes = as.numeric(minutes),
+    seconds = as.numeric(seconds),
+    centiseconds = as.numeric(centiseconds),
+    MP = minutes + seconds / 60 + centiseconds / 6000
+  ) %>%
+  select(-minutes, -seconds, -centiseconds)
+
+
+```
+
+# Add custom variables
+```{r}
+# Average Points vs. Team (CONCERN: gets rid of a lot of data)
+avg_points_vs_team <- nc %>%
+  group_by(Opp) %>%
+  arrange(Date) %>%
+  mutate(avgPTS_vteam = lag(cummean(PTS))) %>%
+  ungroup()
+
+nc <- nc %>%
+  left_join(avg_points_vs_team %>% select(Date, Opp, avgPTS_vteam), by = c("Date", "Opp")) %>%
+  drop_na()
+
+# Opponent Defensive Ratings
+def_ratings <- data.frame(
+  Opp = c("BOS", "DEN", "OKC", "MIN", "LAC", "DAL", "NYK", "MIL", "NOP", "PHO", "CLE", "IND", "LAL", "ORL", "PHI", "GSW", "MIA", "SAC", "HOU", "CHI", "ATL", "BRK", "UTA", "MEM", "TOR", "SAS", "CHO", "POR", "WAS", "DET"),
+  DEF_RTG = c(110.6, 112.3, 111.0, 110.4, 113.1, 114.9, 111.4, 110.2, 111.9, 113.7, 115.0, 117.6, 114.8, 110.8, 113.0, 114.5, 111.5, 114.4, 112.8, 115.7, 115.4, 114.6, 119.6, 113.7, 115.6, 116.1, 116.9, 118.0, 118.6, 118.0)
+)
+
+nc <- nc %>%
+  left_join(def_ratings, by = "Opp")
+
+# Avg and Def Composites
+nc <- nc %>%
+  mutate(comp_opp_50_50 = 0.5 * DEF_RTG + 0.5 * avgPTS_vteam,
+         comp_opp_25_75 = 0.25 * DEF_RTG + 0.75 * avgPTS_vteam,
+         comp_opp_75_25 = 0.75 * DEF_RTG + 0.25 * avgPTS_vteam)
+
+
+# Days of Rest (Capped at 30)
+nc <- nc %>%
+  mutate(days_rest = as.numeric(difftime(Date, lag(Date), units = 'days')))
+
+nc <- nc %>%
+  mutate(days_rest = ifelse(days_rest > 30, 30, days_rest)) %>%
+  drop_na()
+
+# Minutes trend line
+nc <- nc %>%
+  mutate(trend_MP = lag(rollapply(MP, width = 5, FUN = function(x) coef(lm(x ~ seq_along(x)))[2], fill = NA, align = "right"))) %>%
+  drop_na()
+
+# Moving averages
+nc <- nc %>%
+  mutate(avg_PTS_3 = lag(rollapply(PTS, width = 3, FUN = mean, fill = NA, align = "right")),
+         avg_PTS_5 = lag(rollapply(PTS, width = 5, FUN = mean, fill = NA, align = "right")),
+         avg_PTS_season = lag(cummean(PTS))) %>%
+  drop_na()
+
+# Moving % over target in past games
+nc <- nc %>%
+  mutate(perc_over_5 = lag(rollapply(over_target, width = 5, FUN = mean, fill = NA, align = "right") * 100))
+
+# perc_over_10 = lag(rollapply(over_target, width = 10, FUN = mean, fill = NA, align = "right") * 100))
+# removed bc too much missing-ness
+
+
+# Moving Points Trendline
+nc <- nc %>%
+  mutate(trend_PTS = lag(rollapply(PTS, width = 5, FUN = function(x) coef(lm(x ~ seq_along(x)))[2], fill = NA, align = "right"))) %>%
+  drop_na()
+
+# Personal Percentile of Last Game & Last 2 Games
+percentile_rank <- function(x, value) {
+  ecdf(x)(value) * 100
+}
+
+# Calculate personal points percentiles
+nc <- nc %>%
+  mutate(
+    pts_perc_lg = map_dbl(2:n(), ~percentile_rank(PTS[1:(.x-1)], PTS[.x])) %>%
+      c(NA, .),
+    pts_perc_l2g = map_dbl(3:n(), ~percentile_rank(PTS[1:(.x-1)], mean(PTS[(.x-2):(.x-1)]))) %>%
+      c(NA, NA, .)
+  )
+
+nc <- nc %>%
+  drop_na()
+
+# Interaction Variables for Days Rest
+nc <- nc %>%
+  mutate(dr_ap3 = days_rest * avg_PTS_3,
+         dr_ap5 = days_rest * avg_PTS_5,
+         dr_po5 = days_rest * perc_over_5,
+         dr_ha = days_rest * home)
+
+#test_glm <- glm(over_target ~ comp_opp_25_75 + days_rest + avg_PTS_3 + dr_ap3 + avg_PTS_5 + dr_ap5 + avg_PTS_season + trend_PTS + pts_perc_lg + pts_perc_l2g + home + dr_ha + trend_MP + perc_over_5 + dr_po5, nc, family = binomial(link = 'logit'))
+
+
+test_glm <- glm(over_target ~ comp_opp_25_75 + days_rest + avg_PTS_3 + dr_ap3 + avg_PTS_5 + dr_ap5 + avg_PTS_season + trend_PTS + pts_perc_lg + home + dr_po5, nc, family = binomial(link = 'logit'))
+
+summary(test_glm)
+```
+
+
+
+
+
+
+
